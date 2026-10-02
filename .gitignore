@@ -37,3 +37,5 @@ build/
 
 ### Mac OS ###
 .DS_Store
+# 任务队列本地存储
+data/
