@@ -54,6 +54,8 @@ public class FileTaskStore implements TaskStore {
                     byId.put(r.getId(), r);
                     idByDedupKey.put(dedupKey(r.getBusinessKey(), r.getPayload()), r.getId());
                 }
+                // 兼容旧版本数据：旧记录没有 seq/priority/notBefore，反序列化得到默认值 0/null，
+                // 同键旧记录 seq 均为 0，领取时按“seq>0 才算前辈”处理，退化为按创建时间保序（旧行为）。
                 log.info("[store] 从 {} 恢复 {} 条任务记录", storeFile, records.size());
             } else {
                 log.info("[store] 存储文件 {} 不存在，从空队列启动", storeFile);
@@ -90,12 +92,29 @@ public class FileTaskStore implements TaskStore {
                 return SubmitResult.duplicate(existing.getId(), existing.getStatus());
             }
             byId.put(task.getId(), task);
+            // 同业务键内分配单调递增序号：优先级只在“不同键/同键队头之间”生效，不能打乱同键先后。
+            task.setSeq(nextSeqLocked(task.getBusinessKey()));
             idByDedupKey.put(dedupKey(task.getBusinessKey(), task.getPayload()), task.getId());
             persistLocked();
             return SubmitResult.accepted(task.getId());
         } finally {
             lock.writeLock().unlock();
         }
+    }
+
+    private long nextSeqLocked(String businessKey) {
+        long max = 0;
+        for (TaskRecord t : byId.values()) {
+            if (t.getBusinessKey().equals(businessKey) && t.getSeq() > max) {
+                max = t.getSeq();
+            }
+        }
+        return max + 1;
+    }
+
+    /** 任务是否仍是活动态（占着同键队头位置）：排队、执行中、退避重试中都算；终态不算。 */
+    private static boolean active(TaskStatus s) {
+        return s == TaskStatus.PENDING || s == TaskStatus.RUNNING || s == TaskStatus.FAILED;
     }
 
     @Override
@@ -126,14 +145,26 @@ public class FileTaskStore implements TaskStore {
     public List<TaskRecord> claimDue(Instant now, int max) {
         lock.writeLock().lock();
         try {
-            List<TaskRecord> due = byId.values().stream()
+            // 候选：PENDING/FAILED 且到了可领取时间（首次延迟 notBefore/退避后的 nextAttemptAt 都体现在此字段）
+            List<TaskRecord> candidates = byId.values().stream()
                     .filter(t -> (t.getStatus() == TaskStatus.PENDING || t.getStatus() == TaskStatus.FAILED)
                             && !t.getNextAttemptAt().isAfter(now))
-                    .sorted(Comparator.comparing(TaskRecord::getCreatedAt))
-                    .limit(max)
+                    .sorted(Comparator.comparingInt(TaskRecord::getPriority).reversed()
+                            .thenComparing(TaskRecord::getCreatedAt))
                     .toList();
-            List<TaskRecord> claimed = new ArrayList<>(due.size());
-            for (TaskRecord t : due) {
+
+            List<TaskRecord> claimed = new ArrayList<>();
+            // 按优先级顺序领取，但同一业务键必须严格先来后到：
+            // 该键还有序号更小的活动任务（未到点/执行中/退避中）时，后面的任务一律不能提前挑走。
+            // 注意：不能因为某个后辈被挡就屏蔽整个键——真正的同键队头可能就排在它后面，
+            // 必须对每个候选独立判定。
+            for (TaskRecord t : candidates) {
+                if (claimed.size() >= max) {
+                    break;
+                }
+                if (hasEarlierActiveSiblingLocked(t)) {
+                    continue;
+                }
                 t.setStatus(TaskStatus.RUNNING);
                 t.setVersion(t.getVersion() + 1);
                 t.setUpdatedAt(Instant.now());
@@ -146,6 +177,19 @@ public class FileTaskStore implements TaskStore {
         } finally {
             lock.writeLock().unlock();
         }
+    }
+
+    /** 是否存在同业务键、序号更小且仍处于活动态（排队/执行中/退避中）的前辈任务。 */
+    private boolean hasEarlierActiveSiblingLocked(TaskRecord t) {
+        for (TaskRecord other : byId.values()) {
+            if (other != t
+                    && other.getBusinessKey().equals(t.getBusinessKey())
+                    && other.getSeq() > 0 && other.getSeq() < t.getSeq()
+                    && active(other.getStatus())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     @Override
@@ -232,6 +276,47 @@ public class FileTaskStore implements TaskStore {
             t.setUpdatedAt(Instant.now());
             persistLocked();
             return true;
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    @Override
+    public CancelResult cancel(String id) {
+        lock.writeLock().lock();
+        try {
+            TaskRecord t = byId.get(id);
+            if (t == null) {
+                return CancelResult.notFound(id);
+            }
+            switch (t.getStatus()) {
+                case CANCELLED -> {
+                    return CancelResult.alreadyCancelled(id);
+                }
+                case SUCCEEDED -> {
+                    return CancelResult.alreadySucceeded(id);
+                }
+                case RUNNING -> {
+                    return CancelResult.running(id);
+                }
+                case PENDING, FAILED, DEAD -> {
+                    t.setStatus(TaskStatus.CANCELLED);
+                    t.setVersion(t.getVersion() + 1);
+                    t.setUpdatedAt(Instant.now());
+                    // 释放幂等键：取消后允许用同一业务键+同一负载重新提交新任务；
+                    // 仅当映射仍指向本任务时才移除，避免误删重新提交后建立的新映射。
+                    String dedup = dedupKey(t.getBusinessKey(), t.getPayload());
+                    if (id.equals(idByDedupKey.get(dedup))) {
+                        idByDedupKey.remove(dedup);
+                    }
+                    persistLocked();
+                    log.info("[store] 任务已取消 taskId={} businessKey={}", id, t.getBusinessKey());
+                    return CancelResult.cancelled(id);
+                }
+                default -> {
+                    return CancelResult.notFound(id);
+                }
+            }
         } finally {
             lock.writeLock().unlock();
         }

@@ -39,6 +39,12 @@ public interface TaskStore {
     /** 死信再投递：DEAD -> PENDING，attempts 清零。 */
     boolean requeueDead(String id);
 
+    /**
+     * 取消未终结的任务（PENDING/FAILED/DEAD 可取消；RUNNING/SUCCEEDED/CANCELLED 各有可区分结果）。
+     * 取消是原子的：取消后任务不可能再被领取执行。
+     */
+    CancelResult cancel(String id);
+
     List<TaskRecord> listByStatus(TaskStatus status);
 
     List<TaskRecord> listAll();
