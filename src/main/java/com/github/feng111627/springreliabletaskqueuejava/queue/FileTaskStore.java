@@ -80,6 +80,29 @@ public class FileTaskStore implements TaskStore {
         return businessKey + "\u0000" + (payload == null ? "" : payload);
     }
 
+    /**
+     * 测试辅助：把调用方基于 findById 副本修改后的字段写回并持久化。
+     * 生产代码的所有状态变更都应走 claim/mark/cancel 等带状态与版本校验的方法。
+     */
+    public void updateForTest(TaskRecord updated) {
+        lock.writeLock().lock();
+        try {
+            TaskRecord current = byId.get(updated.getId());
+            if (current == null) {
+                throw new IllegalArgumentException("任务不存在: " + updated.getId());
+            }
+            current.setStatus(updated.getStatus());
+            current.setNextAttemptAt(updated.getNextAttemptAt());
+            current.setNotBefore(updated.getNotBefore());
+            current.setAttempts(updated.getAttempts());
+            current.setVersion(updated.getVersion());
+            current.setUpdatedAt(Instant.now());
+            persistLocked();
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
     @Override
     public SubmitResult insertIfAbsent(TaskRecord task) {
         lock.writeLock().lock();
@@ -126,10 +149,24 @@ public class FileTaskStore implements TaskStore {
     public List<TaskRecord> claimDue(Instant now, int max) {
         lock.writeLock().lock();
         try {
-            List<TaskRecord> due = byId.values().stream()
+            // 1) 每个业务键只允许“最早创建的非终结任务”参与领取：
+            //    更早的任务哪怕还在等定时点/退避，也会挡住后面的任务（严格先来后到，优先级不能越级）
+            Map<String, TaskRecord> earliestActiveByKey = new HashMap<>();
+            for (TaskRecord t : byId.values()) {
+                if (isTerminal(t.getStatus())) {
+                    continue;
+                }
+                TaskRecord cur = earliestActiveByKey.get(t.getBusinessKey());
+                if (cur == null || CREATED_ORDER.compare(t, cur) < 0) {
+                    earliestActiveByKey.put(t.getBusinessKey(), t);
+                }
+            }
+            // 2) 队首任务还必须到期（含定时投递点 notBefore 与失败退避 nextAttemptAt）
+            List<TaskRecord> due = earliestActiveByKey.values().stream()
                     .filter(t -> (t.getStatus() == TaskStatus.PENDING || t.getStatus() == TaskStatus.FAILED)
                             && !t.getNextAttemptAt().isAfter(now))
-                    .sorted(Comparator.comparing(TaskRecord::getCreatedAt))
+                    // 3) 积压时高优先级先被消费；同优先级仍按创建时间 FIFO（priority 缺省 0 时与旧行为一致）
+                    .sorted(CLAIM_ORDER)
                     .limit(max)
                     .toList();
             List<TaskRecord> claimed = new ArrayList<>(due.size());
@@ -147,6 +184,19 @@ public class FileTaskStore implements TaskStore {
             lock.writeLock().unlock();
         }
     }
+
+    /** 终态：不再参与调度，也不再阻塞同业务键的后续任务。 */
+    private static boolean isTerminal(TaskStatus status) {
+        return status == TaskStatus.SUCCEEDED || status == TaskStatus.DEAD || status == TaskStatus.CANCELLED;
+    }
+
+    /** 同键内的先后次序：创建时间为主，id 兜底（同毫秒提交也有确定次序）。 */
+    private static final Comparator<TaskRecord> CREATED_ORDER =
+            Comparator.comparing(TaskRecord::getCreatedAt).thenComparing(TaskRecord::getId);
+
+    /** 领取次序：优先级降序，再按创建次序 FIFO。 */
+    private static final Comparator<TaskRecord> CLAIM_ORDER =
+            Comparator.comparingInt(TaskRecord::getPriority).reversed().thenComparing(CREATED_ORDER);
 
     @Override
     public boolean markSucceeded(String id, long version) {
@@ -232,6 +282,46 @@ public class FileTaskStore implements TaskStore {
             t.setUpdatedAt(Instant.now());
             persistLocked();
             return true;
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    @Override
+    public CancelResult cancel(String id, String reason) {
+        lock.writeLock().lock();
+        try {
+            TaskRecord t = byId.get(id);
+            if (t == null) {
+                return CancelResult.notFound(id);
+            }
+            switch (t.getStatus()) {
+                case PENDING, FAILED, DEAD -> {
+                    // 取消生效：终态化并释放幂等键，之后同一业务键+负载可以作为新任务重新提交
+                    t.setStatus(TaskStatus.CANCELLED);
+                    Instant now = Instant.now();
+                    t.setCancelledAt(now);
+                    t.setCancelReason(reason);
+                    t.setVersion(t.getVersion() + 1);
+                    t.setUpdatedAt(now);
+                    idByDedupKey.remove(dedupKey(t.getBusinessKey(), t.getPayload()), t.getId());
+                    persistLocked();
+                    String text = reason == null || reason.isBlank() ? "任务已取消" : "任务已取消: " + reason;
+                    return CancelResult.cancelled(id, text);
+                }
+                case CANCELLED -> {
+                    return CancelResult.alreadyCancelled(id);
+                }
+                case RUNNING -> {
+                    return CancelResult.running(id);
+                }
+                case SUCCEEDED -> {
+                    return CancelResult.alreadyFinished(id, TaskStatus.SUCCEEDED);
+                }
+                default -> {
+                    return CancelResult.alreadyFinished(id, t.getStatus());
+                }
+            }
         } finally {
             lock.writeLock().unlock();
         }

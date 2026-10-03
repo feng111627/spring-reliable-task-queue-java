@@ -18,6 +18,14 @@ public class TaskRecord {
     private Instant updatedAt;
     private String lastError;
     private long version;
+    /** 优先级：整数越大越优先；默认 0，与旧行为一致 */
+    private int priority;
+    /** 定时投递：最早允许开始执行的时间点；null 表示立即可投递。与重试退避互不影响 */
+    private Instant notBefore;
+    /** 取消时间（CANCELLED 终态时填充） */
+    private Instant cancelledAt;
+    /** 取消原因/说明 */
+    private String cancelReason;
 
     public String getId() {
         return id;
@@ -107,6 +115,38 @@ public class TaskRecord {
         this.version = version;
     }
 
+    public int getPriority() {
+        return priority;
+    }
+
+    public void setPriority(int priority) {
+        this.priority = priority;
+    }
+
+    public Instant getNotBefore() {
+        return notBefore;
+    }
+
+    public void setNotBefore(Instant notBefore) {
+        this.notBefore = notBefore;
+    }
+
+    public Instant getCancelledAt() {
+        return cancelledAt;
+    }
+
+    public void setCancelledAt(Instant cancelledAt) {
+        this.cancelledAt = cancelledAt;
+    }
+
+    public String getCancelReason() {
+        return cancelReason;
+    }
+
+    public void setCancelReason(String cancelReason) {
+        this.cancelReason = cancelReason;
+    }
+
     public TaskRecord copy() {
         TaskRecord c = new TaskRecord();
         c.id = id;
@@ -120,6 +160,10 @@ public class TaskRecord {
         c.updatedAt = updatedAt;
         c.lastError = lastError;
         c.version = version;
+        c.priority = priority;
+        c.notBefore = notBefore;
+        c.cancelledAt = cancelledAt;
+        c.cancelReason = cancelReason;
         return c;
     }
 }

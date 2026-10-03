@@ -20,8 +20,12 @@ public interface TaskStore {
     Optional<TaskRecord> findById(String id);
 
     /**
-     * 原子领取到期任务：把 PENDING/FAILED 且 nextAttemptAt <= now 的任务置为 RUNNING。
-     * 返回按创建时间排序的最多 max 条，保证同一任务只会被一个消费者领到。
+     * 原子领取到期任务：
+     * 资格条件（全部满足）：状态为 PENDING/FAILED；nextAttemptAt &lt;= now；
+     * 同一业务键下不存在比它更早创建（createdAt 更小，id 作为次序兜底）的非终结任务
+     * （终结 = SUCCEEDED/DEAD/CANCELLED）——保证同键严格先来后到，优先级与定时投递都不能越级。
+     * 在有资格的任务中按 priority 降序、createdAt 升序、id 升序领取最多 max 条，
+     * 并把它们置为 RUNNING。同一任务只会被一个消费者领到。
      */
     List<TaskRecord> claimDue(Instant now, int max);
 
@@ -38,6 +42,13 @@ public interface TaskStore {
 
     /** 死信再投递：DEAD -> PENDING，attempts 清零。 */
     boolean requeueDead(String id);
+
+    /**
+     * 取消任务：PENDING / FAILED / DEAD -> CANCELLED（终态），释放该任务的幂等键，
+     * 使同一业务键+负载可以重新提交。
+     * RUNNING 不允许取消；SUCCEEDED/CANCELLED 等终态返回可区分的结果；不存在返回 NOT_FOUND。
+     */
+    CancelResult cancel(String id, String reason);
 
     List<TaskRecord> listByStatus(TaskStatus status);
 
