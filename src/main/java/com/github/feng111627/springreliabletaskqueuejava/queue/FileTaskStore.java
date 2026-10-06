@@ -54,8 +54,16 @@ public class FileTaskStore implements TaskStore {
                     byId.put(r.getId(), r);
                     idByDedupKey.put(dedupKey(r.getBusinessKey(), r.getPayload()), r.getId());
                 }
-                // 兼容旧版本数据：旧记录没有 seq/priority/notBefore，反序列化得到默认值 0/null，
-                // 同键旧记录 seq 均为 0，领取时按“seq>0 才算前辈”处理，退化为按创建时间保序（旧行为）。
+                // 兼容旧版本数据：旧记录没有 seq/priority/notBefore，反序列化得到默认值 0/null。
+                // seq=0 是旧记录的可靠标志（新版本入队时 seq 必 >= 1）。加载时按业务键分组、
+                // 按创建时间（提交先后）为旧记录回填 seq=1..k，之后新提交从 k+1 继续递增，
+                // 这样旧任务在新任务眼里同样是“序号更小的前辈”，会正常挡住同键后辈。
+                // 回填后立即落盘，旧数据文件被自动升级，无需用户手工迁移。
+                int backfilled = backfillLegacySeqLocked();
+                if (backfilled > 0) {
+                    persistLocked();
+                    log.info("[store] 兼容升级：为 {} 条旧版本记录回填同键提交序号(seq)，旧数据文件已自动升级", backfilled);
+                }
                 log.info("[store] 从 {} 恢复 {} 条任务记录", storeFile, records.size());
             } else {
                 log.info("[store] 存储文件 {} 不存在，从空队列启动", storeFile);
@@ -110,6 +118,31 @@ public class FileTaskStore implements TaskStore {
             }
         }
         return max + 1;
+    }
+
+    /**
+     * 为旧版本记录（seq=0）回填同业务键提交序号：按业务键分组、按创建时间升序（稳定排序，
+     * 时间相同保持文件中的原始先后）依次编号，接在该键已有最大序号之后。
+     * 返回回填的记录数。调用方需持有写锁。
+     */
+    private int backfillLegacySeqLocked() {
+        Map<String, List<TaskRecord>> legacyByKey = new LinkedHashMap<>();
+        for (TaskRecord t : byId.values()) {
+            if (t.getSeq() == 0) {
+                legacyByKey.computeIfAbsent(t.getBusinessKey(), k -> new ArrayList<>()).add(t);
+            }
+        }
+        int backfilled = 0;
+        for (Map.Entry<String, List<TaskRecord>> entry : legacyByKey.entrySet()) {
+            List<TaskRecord> legacy = entry.getValue();
+            legacy.sort(Comparator.comparing(TaskRecord::getCreatedAt));
+            long seq = nextSeqLocked(entry.getKey());
+            for (TaskRecord t : legacy) {
+                t.setSeq(seq++);
+                backfilled++;
+            }
+        }
+        return backfilled;
     }
 
     /** 任务是否仍是活动态（占着同键队头位置）：排队、执行中、退避重试中都算；终态不算。 */
@@ -184,7 +217,7 @@ public class FileTaskStore implements TaskStore {
         for (TaskRecord other : byId.values()) {
             if (other != t
                     && other.getBusinessKey().equals(t.getBusinessKey())
-                    && other.getSeq() > 0 && other.getSeq() < t.getSeq()
+                    && other.getSeq() < t.getSeq()
                     && active(other.getStatus())) {
                 return true;
             }
