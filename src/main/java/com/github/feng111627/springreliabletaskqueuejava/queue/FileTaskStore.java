@@ -54,9 +54,15 @@ public class FileTaskStore implements TaskStore {
                     byId.put(r.getId(), r);
                     idByDedupKey.put(dedupKey(r.getBusinessKey(), r.getPayload()), r.getId());
                 }
-                // 兼容旧版本数据：旧记录没有 seq/priority/notBefore，反序列化得到默认值 0/null，
-                // 同键旧记录 seq 均为 0，领取时按“seq>0 才算前辈”处理，退化为按创建时间保序（旧行为）。
-                log.info("[store] 从 {} 恢复 {} 条任务记录", storeFile, records.size());
+                // 兼容旧版本数据：旧记录没有 seq/priority/notBefore，反序列化得到默认值 0/null。
+                // 必须在加载时就给旧记录按提交先后补齐同键序号，否则旧任务 seq=0 会被领取逻辑当成
+                // “没有序号的记录”，高优先级新任务(seq>0)就能越过仍在排队/重试的旧任务先执行。
+                int migrated = migrateLegacySeqLocked(records);
+                log.info("[store] 从 {} 恢复 {} 条任务记录（旧数据序号补齐 {} 条）",
+                        storeFile, records.size(), migrated);
+                if (migrated > 0) {
+                    persistLocked();
+                }
             } else {
                 log.info("[store] 存储文件 {} 不存在，从空队列启动", storeFile);
             }
@@ -92,7 +98,8 @@ public class FileTaskStore implements TaskStore {
                 return SubmitResult.duplicate(existing.getId(), existing.getStatus());
             }
             byId.put(task.getId(), task);
-            // 同业务键内分配单调递增序号：优先级只在“不同键/同键队头之间”生效，不能打乱同键先后。
+            // 同业务键内分配单调递增序号（旧记录已在加载迁移时按提交先后占好 1..n）：
+            // 优先级只在“不同键/同键队头之间”生效，不能打乱同键先后。
             task.setSeq(nextSeqLocked(task.getBusinessKey()));
             idByDedupKey.put(dedupKey(task.getBusinessKey(), task.getPayload()), task.getId());
             persistLocked();
@@ -110,6 +117,44 @@ public class FileTaskStore implements TaskStore {
             }
         }
         return max + 1;
+    }
+
+    /**
+     * 旧数据迁移：旧版本记录没有 seq（反序列化为 0）。按业务键把该键全部记录按提交先后
+     * （创建时间升序，相同时间以文件中的先后为准）稳定重排并重新分配 1..n。
+     * 这样旧记录必然排在升级后新提交任务之前，之后 insertIfAbsent 分配的 seq 从 n+1 继续，
+     * “同键严格先来后到”在旧数据与优先级/定时/取消共同作用时依然成立。
+     * 迁移结果立即落盘，重启幂等：再次加载时已无 seq=0 的记录，不会重复迁移。
+     *
+     * @return 被补齐序号的旧记录（seq 原为 0）条数
+     */
+    private int migrateLegacySeqLocked(List<TaskRecord> recordsInFileOrder) {
+        Map<String, List<TaskRecord>> groups = new LinkedHashMap<>();
+        for (TaskRecord r : recordsInFileOrder) {
+            groups.computeIfAbsent(r.getBusinessKey(), k -> new ArrayList<>()).add(r);
+        }
+        Map<String, Integer> fileIndex = new HashMap<>();
+        for (int i = 0; i < recordsInFileOrder.size(); i++) {
+            fileIndex.put(recordsInFileOrder.get(i).getId(), i);
+        }
+        int migrated = 0;
+        for (List<TaskRecord> group : groups.values()) {
+            if (group.stream().noneMatch(r -> r.getSeq() == 0)) {
+                continue;
+            }
+            List<TaskRecord> ordered = new ArrayList<>(group);
+            ordered.sort(Comparator.comparing(TaskRecord::getCreatedAt,
+                            Comparator.nullsFirst(Comparator.naturalOrder()))
+                    .thenComparingInt(r -> fileIndex.get(r.getId())));
+            long seq = 1;
+            for (TaskRecord r : ordered) {
+                if (r.getSeq() == 0) {
+                    migrated++;
+                }
+                r.setSeq(seq++);
+            }
+        }
+        return migrated;
     }
 
     /** 任务是否仍是活动态（占着同键队头位置）：排队、执行中、退避重试中都算；终态不算。 */
@@ -179,12 +224,16 @@ public class FileTaskStore implements TaskStore {
         }
     }
 
-    /** 是否存在同业务键、序号更小且仍处于活动态（排队/执行中/退避中）的前辈任务。 */
+    /**
+     * 是否存在同业务键、序号更小且仍处于活动态（排队/执行中/退避中）的前辈任务。
+     * 不变量：所有在库记录的 seq 都 >= 1（加载时已为旧版本数据补齐），因此直接按序号比较即可，
+     * 旧数据中的前辈与升级后新提交的任务一视同仁。
+     */
     private boolean hasEarlierActiveSiblingLocked(TaskRecord t) {
         for (TaskRecord other : byId.values()) {
             if (other != t
                     && other.getBusinessKey().equals(t.getBusinessKey())
-                    && other.getSeq() > 0 && other.getSeq() < t.getSeq()
+                    && other.getSeq() < t.getSeq()
                     && active(other.getStatus())) {
                 return true;
             }
